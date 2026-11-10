@@ -1,0 +1,73 @@
+name: Android ARM64 APK
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  android:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check signing secrets
+        env:
+          KEY: ${{ secrets.ANDROID_KEY_BASE64 }}
+          ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          STORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          for value in "$KEY" "$ALIAS" "$STORE_PASS" "$KEY_PASS"; do
+            test -n "$value" || { echo 'Missing Android signing secrets'; exit 1; }
+          done
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Android SDK and NDK
+        run: |
+          SDK="$ANDROID_HOME"
+          "$SDK/cmdline-tools/latest/bin/sdkmanager" --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
+          echo "NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: android-arm64
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm tauri android init --ci
+      - run: pnpm tauri android build --apk --target aarch64
+      - name: Sign and verify APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          KS="$RUNNER_TEMP/android-release.keystore"
+          trap 'rm -f "$KS"' EXIT
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KS"
+          TOOLS="$ANDROID_HOME/build-tools/36.0.0"
+          mkdir -p artifacts
+          mapfile -t APKS < <(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*-release*.apk')
+          test "${#APKS[@]}" -eq 1
+          "$TOOLS/zipalign" -f -p 4 "${APKS[0]}" "$RUNNER_TEMP/aligned.apk"
+          "$TOOLS/apksigner" sign --ks "$KS" --ks-key-alias "$KEY_ALIAS" --ks-pass env:STORE_PASSWORD --key-pass env:KEY_PASSWORD --v4-signing-enabled false --out artifacts/HGhub-arm64.apk "$RUNNER_TEMP/aligned.apk"
+          "$TOOLS/apksigner" verify --verbose artifacts/HGhub-arm64.apk
+          sha256sum artifacts/HGhub-arm64.apk > artifacts/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HGhub-Android-arm64
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
